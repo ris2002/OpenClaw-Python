@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { mailmindApi } from "./api";
 
 const Ic = ({ d, size = 14 }) => (
@@ -35,6 +35,9 @@ export default function MailMind() {
   const [fetching, setFetching] = useState(false);
   const [daemonLoading, setDaemonLoading] = useState(false);
   const [draftLoading, setDraftLoading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [fetchError, setFetchError] = useState("");
   const [interval, setIntervalVal] = useState(30);
   const [intervalSaving, setIntervalSaving] = useState(false);
   const [dateFrom, setDateFrom] = useState("");
@@ -42,12 +45,47 @@ export default function MailMind() {
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [filtering, setFiltering] = useState(false);
 
-  const refreshStatus = () => mailmindApi.daemonStatus().then(setStatus).catch(() => {});
+  const lastCheckRef = useRef("—");
+  const filterRef   = useRef({ dateFrom: "", dateTo: "", flaggedOnly: false });
+
+  const mergeEmails = (fresh, prev) => {
+    const prevMap = {};
+    prev.forEach(e => { prevMap[e.id] = e; });
+    return fresh.map(e => {
+      const old = prevMap[e.id];
+      if (!old) return e;
+      // If backend explicitly reset summarised (thread has new replies), trust the backend.
+      // Otherwise keep richer local state so mid-stream summaries aren't wiped.
+      const backendReset = !e.summarised && !e.summary;
+      return {
+        ...e,
+        flagged:    old.flagged ?? e.flagged,
+        summarised: backendReset ? false : (old.summarised || e.summarised),
+        summary:    backendReset ? ""    : (old.summary    || e.summary),
+      };
+    });
+  };
+
+  const refreshStatus = async () => {
+    try {
+      const s = await mailmindApi.daemonStatus();
+      setStatus(s);
+      if (s.last_check !== "—" && s.last_check !== lastCheckRef.current) {
+        lastCheckRef.current = s.last_check;
+        const { dateFrom: df, dateTo: dt, flaggedOnly: fo } = filterRef.current;
+        const fresh = await (df || dt || fo
+          ? mailmindApi.listFiltered(df, dt, fo)
+          : mailmindApi.list());
+        if (Array.isArray(fresh)) setEmails(prev => mergeEmails(fresh, prev));
+      }
+    } catch {}
+  };
 
   useEffect(() => {
     Promise.all([mailmindApi.daemonStatus(), mailmindApi.list(), mailmindApi.getSettings()])
       .then(([s, e, settings]) => {
         setStatus(s);
+        lastCheckRef.current = s.last_check ?? "—";
         setEmails(Array.isArray(e) ? e : []);
         if (settings?.check_interval) setIntervalVal(settings.check_interval);
       })
@@ -95,16 +133,13 @@ export default function MailMind() {
 
   const handleFetch = async () => {
     setFetching(true);
+    setFetchError("");
     try {
       const fetched = await mailmindApi.fetchInbox();
-      if (Array.isArray(fetched)) {
-        setEmails(prev => {
-          const prevMap = {};
-          prev.forEach(e => { prevMap[e.id] = e; });
-          return fetched.map(e => ({ ...e, flagged: prevMap[e.id]?.flagged ?? e.flagged }));
-        });
-      }
-    } catch (e) { console.error(e); }
+      if (Array.isArray(fetched)) setEmails(prev => mergeEmails(fetched, prev));
+    } catch (e) {
+      setFetchError(e.message || "Inbox fetch failed — check Gmail connection.");
+    }
     setFetching(false);
   };
 
@@ -143,9 +178,14 @@ export default function MailMind() {
   const handleFlag = async (email) => {
     try {
       const res = await mailmindApi.flag(email.id);
-      const updated = { ...email, flagged: res.flagged };
+      const updated = { ...email, flagged: res.flagged, summarised: false, summary: "" };
       setEmails(prev => prev.map(e => e.id === email.id ? updated : e));
-      if (selectedEmail?.id === email.id) setSelectedEmail(updated);
+      if (selectedEmail?.id === email.id) {
+        setSelectedEmail(updated);
+        setSummariseFailed(false);
+        setRetryCount(0);
+        await _runSummarise(updated);
+      }
     } catch (e) { console.error(e); }
   };
 
@@ -177,14 +217,23 @@ export default function MailMind() {
   };
 
   const handleSend = async () => {
-    try { await mailmindApi.sendReply(replyPanel.emailId, replyPanel.draft); } catch (e) { console.error(e); }
+    setSending(true);
+    setSendError("");
     const emailId = replyPanel.emailId;
-    setReplyPanel(null);
-    setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
+    try {
+      await mailmindApi.sendReply(emailId, replyPanel.draft);
+      setReplyPanel(null);
+      setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
+      if (selectedEmail?.id === emailId) setSelectedEmail(prev => ({ ...prev, read: true }));
+    } catch (e) {
+      setSendError(e.message || "Failed to send — check your Gmail connection.");
+    }
+    setSending(false);
   };
 
   const handleFilter = async () => {
     setFiltering(true);
+    filterRef.current = { dateFrom, dateTo, flaggedOnly };
     try {
       const filtered = await mailmindApi.listFiltered(dateFrom, dateTo, flaggedOnly);
       setEmails(Array.isArray(filtered) ? filtered : []);
@@ -194,6 +243,7 @@ export default function MailMind() {
 
   const handleClearFilter = async () => {
     setDateFrom(""); setDateTo(""); setFlaggedOnly(false);
+    filterRef.current = { dateFrom: "", dateTo: "", flaggedOnly: false };
     const all = await mailmindApi.list().catch(() => []);
     setEmails(Array.isArray(all) ? all : []);
   };
@@ -299,19 +349,30 @@ export default function MailMind() {
         )}
 
         {/* Manual fetch — always available */}
-        <button className="oc-btn oc-btn--primary" onClick={handleFetch} disabled={fetching}
-          style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 12px", fontSize: 12 }}>
-          <span style={{ animation: fetching ? "oc-spin 1s linear infinite" : "none", display: "flex" }}>
-            <Ic d={IC.refresh} size={12} />
-          </span>
-          {fetching ? "Checking…" : "Check inbox"}
-        </button>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+          <button className="oc-btn oc-btn--primary" onClick={handleFetch} disabled={fetching}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 12px", fontSize: 12 }}>
+            <span style={{ animation: fetching ? "oc-spin 1s linear infinite" : "none", display: "flex" }}>
+              <Ic d={IC.refresh} size={12} />
+            </span>
+            {fetching ? "Checking…" : "Check inbox"}
+          </button>
+          {fetchError && (
+            <span style={{ fontSize: 10, color: "var(--danger)", fontFamily: "var(--font-mono)", maxWidth: 200, textAlign: "right" }}>
+              {fetchError}
+            </span>
+          )}
+        </div>
       </div>
 
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "340px 1fr", overflow: "hidden" }}>
         {/* List */}
-        <div style={{ borderRight: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column", background: "var(--bg-0)" }}>
-          <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column", gap: 6 }}>
+        <div style={{ borderRight: "1px solid var(--border-subtle)", overflowY: "auto", background: "var(--bg-0)" }}>
+          <div style={{
+            padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)",
+            display: "flex", flexDirection: "column", gap: 6,
+            position: "sticky", top: 0, zIndex: 2, background: "var(--bg-0)",
+          }}>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
               <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="oc-input"
                 style={{ padding: "5px 8px", fontSize: 11, fontFamily: "var(--font-mono)", colorScheme: "dark" }} />
@@ -336,7 +397,7 @@ export default function MailMind() {
             </div>
           </div>
 
-          <div style={{ flex: 1, overflowY: "auto" }}>
+          <div>
             {sortedEmails.length === 0 ? (
               <div style={{ padding: "48px 20px", textAlign: "center" }}>
                 <p style={{ color: "var(--text-3)", fontSize: 12, margin: 0 }}>No emails yet</p>
@@ -374,7 +435,9 @@ export default function MailMind() {
                   </span>
                 </div>
                 <p style={{
-                  fontSize: 12, color: "var(--text-1)", margin: 0, fontWeight: 500,
+                  fontSize: 12, margin: 0,
+                  fontWeight: email.read ? 400 : 500,
+                  color: email.read ? "var(--text-3)" : "var(--text-1)",
                   whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
                 }}>{email.subject}</p>
               </div>
@@ -409,8 +472,9 @@ export default function MailMind() {
                     letterSpacing: "0.08em", textTransform: "uppercase",
                   }}>
                     {summarising
-                      ? retryCount > 0 ? `Retrying (${retryCount})…` : "Summarising"
-                      : summariseFailed ? "Failed" : "AI Summary"}
+                      ? retryCount > 0 ? `Retrying (${retryCount})…` : (selectedEmail?.flagged ? "Building conversation…" : "Summarising")
+                      : summariseFailed ? "Failed"
+                      : selectedEmail?.flagged ? "Conversation" : "AI Summary"}
                   </span>
                   {summarising && (
                     <div style={{ display: "flex", gap: 3 }}>
@@ -455,7 +519,7 @@ export default function MailMind() {
 
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button className="oc-btn oc-btn--primary"
-                  onClick={() => setReplyPanel({ emailId: selectedEmail.id, intent: "", draft: "", stage: "intent" })}
+                  onClick={() => { setReplyPanel({ emailId: selectedEmail.id, intent: "", draft: "", stage: "intent" }); setSendError(""); }}
                   style={{ flex: 2, minWidth: 140, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "10px" }}>
                   <Ic d={IC.reply} size={13} /> Draft reply
                 </button>
@@ -535,12 +599,20 @@ export default function MailMind() {
                     onChange={e => setReplyPanel(p => ({ ...p, draft: e.target.value }))}
                     rows={12} className="oc-input"
                     style={{ resize: "vertical", lineHeight: 1.7, marginBottom: 12, fontSize: 13 }} />
+                  {sendError && (
+                    <p style={{
+                      fontSize: 12, color: "var(--danger)", marginBottom: 10,
+                      padding: "8px 12px", background: "rgba(201,112,100,0.08)",
+                      borderRadius: "var(--r-sm)", border: "1px solid rgba(201,112,100,0.25)",
+                    }}>{sendError}</p>
+                  )}
                   <div style={{ display: "flex", gap: 8 }}>
                     <button className="oc-btn oc-btn--primary" onClick={handleSend}
+                      disabled={sending}
                       style={{ flex: 2, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: 11 }}>
-                      <Ic d={IC.send} size={12} /> Send reply
+                      <Ic d={IC.send} size={12} /> {sending ? "Sending…" : "Send reply"}
                     </button>
-                    <button className="oc-btn" onClick={() => setReplyPanel(p => ({ ...p, stage: "intent" }))}
+                    <button className="oc-btn" onClick={() => { setReplyPanel(p => ({ ...p, stage: "intent" })); setSendError(""); }}
                       style={{ flex: 1, padding: 11 }}>Redraft</button>
                   </div>
                 </div>

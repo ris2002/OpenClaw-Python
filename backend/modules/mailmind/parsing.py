@@ -91,6 +91,11 @@ def extract_body(msg) -> str:
     return body.strip()
 
 
+def normalize_subject(subject: str) -> str:
+    """Strip Re:/Fwd: prefixes to get the canonical thread subject."""
+    return re.sub(r"^(re|fwd?|aw|sv)[\s:]+", "", subject.strip(), flags=re.IGNORECASE).strip().lower()
+
+
 def extract_sender_name(sender_full: str) -> str:
     name = sender_full.split("<")[0].strip().strip('"').strip("'")
     if not name:

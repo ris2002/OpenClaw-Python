@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt_mod
 import email as email_lib
 import threading
 import time
@@ -29,20 +30,31 @@ def _time_key(e: dict) -> float:
 # Fetch
 # ─────────────────────────────────────────────────────────────
 def fetch_inbox() -> list[dict]:
-    """Fetch unread emails from Gmail IMAP and merge into the local store."""
+    """Fetch unread emails from Gmail IMAP and merge into the local store.
+
+    Uses IMAP UIDs (not sequence numbers) so IDs are stable across reconnections.
+    The same email always gets the same key, so summaries and flags survive backend restarts.
+    """
     mail = gmail.get_imap()
     mail.select("INBOX")
-    _, data = mail.search(None, "UNSEEN")
-    email_ids = data[0].split()[-10:]
+
+    # Fetch UNSEEN emails AND any email from the last 3 days.
+    # Using UNSEEN alone misses emails already opened in Gmail web or on a phone.
+    since = (dt_mod.date.today() - dt_mod.timedelta(days=3)).strftime("%d-%b-%Y")
+    _, unseen_data = mail.uid("search", None, "UNSEEN")
+    _, recent_data = mail.uid("search", None, f"SINCE {since}")
+    combined = sorted(set(unseen_data[0].split()) | set(recent_data[0].split()))
+    email_uids = combined[-15:]  # most recent 15 across both sets
 
     emails = store.load_emails()
+    existing_ids = set(emails.keys())
 
-    for eid in reversed(email_ids):
-        eid_str = eid.decode()
-        if eid_str in emails:
+    for uid in reversed(email_uids):
+        uid_str = uid.decode()
+        if uid_str in emails:
             continue
         try:
-            _, msg_data = mail.fetch(eid, "(RFC822)")
+            _, msg_data = mail.uid("fetch", uid_str, "(RFC822)")
             raw = msg_data[0][1]
             msg = email_lib.message_from_bytes(raw)
 
@@ -64,12 +76,13 @@ def fetch_inbox() -> list[dict]:
             body = parsing.extract_body(msg)
             sender_name, sender_first = parsing.extract_real_name(sender_full)
 
-            emails[eid_str] = {
-                "id": eid_str,
+            emails[uid_str] = {
+                "id": uid_str,
                 "sender": sender_name,
                 "sender_first": sender_first,
                 "sender_email": sender_email_addr,
                 "subject": subject,
+                "thread_subject": parsing.normalize_subject(subject),
                 "summary": "",
                 "body": body[:3000],
                 "time": time_clean,
@@ -79,15 +92,52 @@ def fetch_inbox() -> list[dict]:
                 "summarised": False,
             }
         except Exception as e:
-            print(f"[mailmind.fetch] failed {eid_str}: {e}")
+            print(f"[mailmind.fetch] failed uid={uid_str}: {e}")
             continue
 
     mail.logout()
+
+    # For every new email that belongs to a flagged thread, invalidate the
+    # flagged email's cached summary so the next open regenerates it with
+    # the new reply included in the conversation.
+    _invalidate_stale_thread_summaries(emails, new_ids=set(emails.keys()) - existing_ids)
+
     store.save_emails(emails)
 
     all_emails = list(emails.values())
     all_emails.sort(key=_time_key, reverse=True)
     return all_emails
+
+
+def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> None:
+    """Mark flagged emails as needing re-summarisation when their thread has new messages.
+
+    Uses explicit new_ids (IDs added in this fetch cycle) rather than summarised=False
+    as the proxy for "new", which would cause false positives for just-flagged emails
+    and failed summarisations.
+    """
+    if not new_ids:
+        return
+
+    flagged_index: dict[tuple, list[str]] = {}
+    for eid, e in emails.items():
+        if e.get("flagged") and e.get("summarised"):
+            key = (
+                e.get("sender_email", ""),
+                e.get("thread_subject", parsing.normalize_subject(e.get("subject", ""))),
+            )
+            flagged_index.setdefault(key, []).append(eid)
+
+    for eid in new_ids:
+        e = emails.get(eid, {})
+        key = (
+            e.get("sender_email", ""),
+            e.get("thread_subject", parsing.normalize_subject(e.get("subject", ""))),
+        )
+        for flagged_id in flagged_index.get(key, []):
+            emails[flagged_id]["summarised"] = False
+            emails[flagged_id]["summary"] = ""
+            print(f"[mailmind.fetch] thread updated — invalidated summary for flagged email {flagged_id}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -159,7 +209,11 @@ def summarise(email_id: str) -> dict:
 
 
 def summarise_stream(email_id: str):
-    """Yield summary tokens, save to store when done. Re-generates if cached summary is empty."""
+    """Yield summary tokens, save to store when done.
+
+    Flagged emails get a conversation-level summary across all messages from
+    the same sender. Unflagged emails get a per-email summary.
+    """
     emails = store.load_emails()
     data = emails.get(email_id)
     if not data:
@@ -169,40 +223,72 @@ def summarise_stream(email_id: str):
         return
 
     user_name = module_settings.get("user_name", "Rishil")
-    prompt = prompts.summary_prompt(
-        sender=data.get("sender", ""),
-        subject=data.get("subject", ""),
-        body=data.get("body", ""),
-        user_name=user_name,
-    )
+
+    if data.get("flagged"):
+        sender_email = data.get("sender_email", "")
+        thread_subject = data.get(
+            "thread_subject",
+            parsing.normalize_subject(data.get("subject", "")),
+        )
+        thread_emails = sorted(
+            [
+                e for e in emails.values()
+                if e.get("sender_email") == sender_email
+                and e.get(
+                    "thread_subject",
+                    parsing.normalize_subject(e.get("subject", "")),
+                ) == thread_subject
+            ],
+            key=_time_key,
+        )
+        prompt = prompts.conversation_summary_prompt(
+            sender=data.get("sender", ""),
+            thread_emails=thread_emails,
+            user_name=user_name,
+        )
+    else:
+        prompt = prompts.summary_prompt(
+            sender=data.get("sender", ""),
+            subject=data.get("subject", ""),
+            body=data.get("body", ""),
+            user_name=user_name,
+        )
 
     chunks = []
+    summary = ""
     try:
-        for token in llm_stream(prompt):
-            chunks.append(token)
-            yield token
-    except Exception as e:
-        print(f"[mailmind.summarise_stream] LLM error: {e}")
+        try:
+            for token in llm_stream(prompt):
+                chunks.append(token)
+                yield token
+        except Exception as e:
+            print(f"[mailmind.summarise_stream] LLM error: {e}")
 
-    summary = "".join(chunks).strip()
+        summary = "".join(chunks).strip()
 
-    if not summary:
-        # LLM returned nothing — build a plain-text extract so the user always gets something
-        body = data.get("body", "").strip()
-        sender = data.get("sender", "Unknown")
-        subject = data.get("subject", "")
-        if body:
-            excerpt = " ".join(body[:300].split())
-            summary = f"{sender}: {excerpt}…"
-        else:
-            summary = f"Email from {sender} — {subject or '(no subject)'}"
-        yield summary
-
-    emails = store.load_emails()
-    if email_id in emails:
-        emails[email_id]["summary"] = summary
-        emails[email_id]["summarised"] = True
-        store.save_emails(emails)
+        if not summary:
+            body = data.get("body", "").strip()
+            sender = data.get("sender", "Unknown")
+            subject = data.get("subject", "")
+            if body:
+                excerpt = " ".join(body[:300].split())
+                summary = f"{sender}: {excerpt}…"
+            else:
+                summary = f"Email from {sender} — {subject or '(no subject)'}"
+            yield summary
+    finally:
+        # Always persist whatever we have — even if the client disconnects mid-stream.
+        # This prevents the email from being re-summarised on every restart.
+        if summary:
+            saved = store.load_emails()
+            if email_id in saved:
+                saved[email_id]["summary"] = summary
+                saved[email_id]["summarised"] = True
+                store.save_emails(saved)
+                if saved[email_id].get("flagged"):
+                    chroma_path = module_settings.get("chroma_path", "")
+                    if chroma_path:
+                        chroma.embed_email(saved[email_id], chroma_path)
 
 
 def toggle_flag(email_id: str) -> dict:
@@ -211,21 +297,28 @@ def toggle_flag(email_id: str) -> dict:
         raise LookupError("Email not found")
     new_flagged = not emails[email_id].get("flagged", False)
     emails[email_id]["flagged"] = new_flagged
+    # Reset so the next open regenerates a conversation summary (flagged) or per-email summary (unflagged)
+    emails[email_id]["summarised"] = False
+    emails[email_id]["summary"] = ""
     store.save_emails(emails)
 
-    chroma_path = module_settings.get("chroma_path", "")
-    if chroma_path:
-        if new_flagged:
-            chroma.embed_email(emails[email_id], chroma_path)
-        else:
+    # Unflag → remove from vector store immediately.
+    # Flag → embedding happens after the conversation summary is generated (in summarise_stream),
+    # so the vector actually contains useful content.
+    if not new_flagged:
+        chroma_path = module_settings.get("chroma_path", "")
+        if chroma_path:
             chroma.delete_embedding(email_id, chroma_path)
+
     return {"flagged": new_flagged}
 
 
 def dismiss(email_id: str, delete_embeddings: bool = False) -> dict:
     emails = store.load_emails()
     data = emails.get(email_id)
-    if data and data.get("flagged") and delete_embeddings:
+    # Always clean up ChromaDB when a flagged email is dismissed — not doing so
+    # leaves orphan vectors that pollute reply-draft context forever.
+    if data and data.get("flagged"):
         chroma_path = module_settings.get("chroma_path", "")
         if chroma_path:
             chroma.delete_embedding(email_id, chroma_path)

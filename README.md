@@ -139,12 +139,48 @@ If the LLM returns nothing (model not loaded, Ollama down, etc.) the backend fal
 
 The email list shows sender, subject, and timestamp only — no summary preview in the list. The AI summary only appears in the detail panel when an email is opened. Emails are sorted newest-first.
 
+**Read / unread styling:** unread emails show an amber dot, bold sender name, and bold subject. Read emails dim both sender and subject to lower-contrast colours — no dismissal needed to distinguish handled from new.
+
+**Filter bar:** date range + flagged-only filter is pinned sticky at the top of the list column. Scrolling anywhere in the column (including over the filter bar) scrolls the email list. The active filter is preserved across daemon auto-refreshes — new emails pulled in by the daemon are merged into the filtered view, not shown unfiltered.
+
 ### Retry on failed summary
 
 If summarisation fails, a **Retry** button appears in the summary box. Each retry attempt:
 - Increments a visible counter (`Retry (2)`, `Retry (3)`, …)
 - Shows `Retrying (N)…` in the header label while in progress
 - Forces a fresh LLM call, bypassing the cache check
+
+### Flagged emails — conversation tracking
+
+Flagging an email switches it from per-email summarisation to **conversation-level summarisation**. The conversation is defined by emails that share both the same sender address and the same base thread subject (stripping `Re:`, `Fwd:`, etc.). Up to the 5 most recent emails in that thread are included in the summary prompt.
+
+**Conversation summary lifecycle:**
+1. Flag email → summary reset, email re-opens in "Building conversation…" state
+2. Conversation summary generates and streams in — includes all matched thread emails
+3. Summary is saved and embedded into ChromaDB (used as context when drafting replies)
+4. Unflag → summary reset, embedding deleted from ChromaDB, next open gets a per-email summary
+5. New reply arrives from same sender on same thread → flagged email's summary is automatically invalidated on next fetch → reopening regenerates an updated conversation summary
+
+**ChromaDB path:** set in Settings → MailMind → Chroma path. Default is `~/.openclaw/mailmind_chroma` (outside the project, no git tracking). Any writable absolute path works — point it at an existing folder and ChromaDB uses it as-is. Requires `pip install chromadb`; if not installed, all chroma calls fail silently and the rest of the app is unaffected.
+
+### Stable email identity across restarts
+
+Emails are keyed by **IMAP UID** (not sequence number). UIDs are permanent within a mailbox — the same email has the same UID every time you reconnect. This means summaries, flags, and conversation state all survive backend restarts without re-fetching or re-summarising.
+
+Previously summarised emails load their cached summary instantly on reopen. The LLM is never called twice for the same email unless the summary is explicitly invalidated (flag toggle, new thread reply).
+
+### Sending replies
+
+After drafting a reply (intent → generate → review), clicking **Send reply**:
+- Sends via Gmail SMTP
+- Marks the email as read in the inbox (dimmed styling)
+- Keeps the email in the inbox for reference
+- Shows "Sending…" on the button while in flight
+- On failure: shows a red error banner with the reason; panel stays open so you can retry or redraft
+
+### Auto-refresh when daemon fetches
+
+The frontend polls daemon status every 15 seconds. When `last_check` changes (daemon ran a fetch), the email list is automatically refreshed — new emails appear without any manual action. The refresh respects the active filter, so a filtered view stays filtered after a daemon-triggered update.
 
 ## Adding a new module
 
