@@ -85,6 +85,14 @@ def summarise_stream(email_id: str):
     )
 
 
+@router.get("/emails/{email_id}/thread")
+def get_thread(email_id: str):
+    try:
+        return service.get_thread(email_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+
 @router.post("/emails/flag")
 def flag(body: FlagIn):
     try:

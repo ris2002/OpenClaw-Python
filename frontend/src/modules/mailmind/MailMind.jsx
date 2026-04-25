@@ -40,6 +40,7 @@ export default function MailMind() {
   const [fetchError, setFetchError] = useState("");
   const [interval, setIntervalVal] = useState(30);
   const [intervalSaving, setIntervalSaving] = useState(false);
+  const [thread, setThread] = useState([]);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [flaggedOnly, setFlaggedOnly] = useState(false);
@@ -98,8 +99,12 @@ export default function MailMind() {
     setReplyPanel(null);
     setSummariseFailed(false);
     setRetryCount(0);
+    setThread([]);
     const preview = email.body ? email.body.slice(0, 200).replace(/\s+/g, " ") + "…" : "";
     setSelectedEmail({ ...email, _preview: preview });
+    if (email.flagged) {
+      mailmindApi.getThread(email.id).then(t => setThread(Array.isArray(t) ? t : [])).catch(() => {});
+    }
     if (email.summarised) return;
     await _runSummarise(email);
   };
@@ -184,6 +189,11 @@ export default function MailMind() {
         setSelectedEmail(updated);
         setSummariseFailed(false);
         setRetryCount(0);
+        if (res.flagged) {
+          mailmindApi.getThread(email.id).then(t => setThread(Array.isArray(t) ? t : [])).catch(() => {});
+        } else {
+          setThread([]);
+        }
         await _runSummarise(updated);
       }
     } catch (e) { console.error(e); }
@@ -223,8 +233,19 @@ export default function MailMind() {
     try {
       await mailmindApi.sendReply(emailId, replyPanel.draft);
       setReplyPanel(null);
+      const wasFlagged = selectedEmail?.flagged;
+      const updated = { ...(selectedEmail || {}), read: true, summarised: !wasFlagged, summary: wasFlagged ? "" : (selectedEmail?.summary || "") };
       setEmails(prev => prev.map(e => e.id === emailId ? { ...e, read: true } : e));
-      if (selectedEmail?.id === emailId) setSelectedEmail(prev => ({ ...prev, read: true }));
+      if (selectedEmail?.id === emailId) {
+        setSelectedEmail(updated);
+        if (wasFlagged) {
+          // Refresh thread so sent reply appears immediately, then re-summarise
+          mailmindApi.getThread(emailId).then(t => setThread(Array.isArray(t) ? t : [])).catch(() => {});
+          setSummariseFailed(false);
+          setRetryCount(0);
+          await _runSummarise({ ...updated, summarised: false });
+        }
+      }
     } catch (e) {
       setSendError(e.message || "Failed to send — check your Gmail connection.");
     }
@@ -516,6 +537,52 @@ export default function MailMind() {
                   }}>{summaryDisplay || "Summary loading…"}</p>
                 )}
               </div>
+
+              {selectedEmail.flagged && thread.length > 0 && (
+                <div style={{ marginBottom: 22 }}>
+                  <div style={{
+                    fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--text-3)",
+                    letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10,
+                  }}>Thread · {thread.length} message{thread.length !== 1 ? "s" : ""}</div>
+                  {thread.map((e) => {
+                    const isSent = e.direction === "sent";
+                    return (
+                      <details key={e.id} style={{
+                        marginBottom: 6,
+                        border: `1px solid ${isSent ? "var(--accent-line)" : "var(--border-subtle)"}`,
+                        borderRadius: "var(--r-md)",
+                        background: isSent ? "var(--accent-soft)" : "var(--bg-1)",
+                        overflow: "hidden",
+                      }}>
+                        <summary style={{
+                          padding: "10px 14px", cursor: "pointer", listStyle: "none",
+                          display: "flex", alignItems: "center", gap: 8,
+                        }}>
+                          <span style={{
+                            fontSize: 12, fontWeight: 500,
+                            color: isSent ? "var(--accent)" : "var(--text-0)",
+                            flexShrink: 0,
+                          }}>{isSent ? "You" : e.sender}</span>
+                          <span style={{
+                            fontSize: 11, color: "var(--text-2)",
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+                          }}>{e.subject}</span>
+                          <span style={{
+                            fontSize: 10, color: "var(--text-3)",
+                            fontFamily: "var(--font-mono)", flexShrink: 0,
+                          }}>{e.time}</span>
+                        </summary>
+                        <p style={{
+                          margin: 0, padding: "0 14px 14px",
+                          fontSize: 13, color: "var(--text-1)", lineHeight: 1.65,
+                          whiteSpace: "pre-wrap", borderTop: "1px solid var(--border-subtle)",
+                          paddingTop: 12, marginTop: 0,
+                        }}>{e.body}</p>
+                      </details>
+                    );
+                  })}
+                </div>
+              )}
 
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button className="oc-btn oc-btn--primary"

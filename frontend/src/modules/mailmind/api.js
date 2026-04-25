@@ -30,6 +30,7 @@ export const mailmindApi = {
     if (!full.trim()) throw new Error("LLM returned empty response");
     return full;
   },
+  getThread:      (id) => get(`${BASE}/emails/${id}/thread`),
   flag:           (id) => post(`${BASE}/emails/flag`, { email_id: id }),
   dismiss:        (id) => post(`${BASE}/emails/dismiss`, { email_id: id }),
   blockSender:    (id) => post(`${BASE}/emails/${id}/block-sender`),

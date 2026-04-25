@@ -38,13 +38,9 @@ def fetch_inbox() -> list[dict]:
     mail = gmail.get_imap()
     mail.select("INBOX")
 
-    # Fetch UNSEEN emails AND any email from the last 3 days.
-    # Using UNSEEN alone misses emails already opened in Gmail web or on a phone.
-    since = (dt_mod.date.today() - dt_mod.timedelta(days=3)).strftime("%d-%b-%Y")
-    _, unseen_data = mail.uid("search", None, "UNSEEN")
-    _, recent_data = mail.uid("search", None, f"SINCE {since}")
-    combined = sorted(set(unseen_data[0].split()) | set(recent_data[0].split()))
-    email_uids = combined[-15:]  # most recent 15 across both sets
+    # Fetch all emails (seen and unseen) — sort numerically so newest UIDs are last.
+    _, all_data = mail.uid("search", None, "ALL")
+    email_uids = sorted(all_data[0].split(), key=lambda uid: int(uid))[-30:]
 
     emails = store.load_emails()
     existing_ids = set(emails.keys())
@@ -97,27 +93,36 @@ def fetch_inbox() -> list[dict]:
 
     mail.logout()
 
-    # For every new email that belongs to a flagged thread, invalidate the
-    # flagged email's cached summary so the next open regenerates it with
-    # the new reply included in the conversation.
-    _invalidate_stale_thread_summaries(emails, new_ids=set(emails.keys()) - existing_ids)
+    # For every new email that belongs to a flagged thread, invalidate the summary
+    # and immediately kick off a background re-summarise so the result is ready
+    # before the user opens the email.
+    new_ids = set(emails.keys()) - existing_ids
+    invalidated = _invalidate_stale_thread_summaries(emails, new_ids=new_ids)
 
     store.save_emails(emails)
 
-    all_emails = list(emails.values())
+    for flagged_id in invalidated:
+        t = threading.Thread(
+            target=_background_resurface,
+            args=(flagged_id,),
+            daemon=True,
+            name=f"mailmind-resurface-{flagged_id}",
+        )
+        t.start()
+
+    all_emails = [e for e in emails.values() if e.get("direction") != "sent"]
     all_emails.sort(key=_time_key, reverse=True)
     return all_emails
 
 
-def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> None:
+def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> list[str]:
     """Mark flagged emails as needing re-summarisation when their thread has new messages.
 
-    Uses explicit new_ids (IDs added in this fetch cycle) rather than summarised=False
-    as the proxy for "new", which would cause false positives for just-flagged emails
-    and failed summarisations.
+    Returns the list of flagged email IDs that were invalidated so the caller can
+    trigger background re-summarisation.
     """
     if not new_ids:
-        return
+        return []
 
     flagged_index: dict[tuple, list[str]] = {}
     for eid, e in emails.items():
@@ -128,6 +133,7 @@ def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> None:
             )
             flagged_index.setdefault(key, []).append(eid)
 
+    invalidated: list[str] = []
     for eid in new_ids:
         e = emails.get(eid, {})
         key = (
@@ -137,7 +143,22 @@ def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> None:
         for flagged_id in flagged_index.get(key, []):
             emails[flagged_id]["summarised"] = False
             emails[flagged_id]["summary"] = ""
-            print(f"[mailmind.fetch] thread updated — invalidated summary for flagged email {flagged_id}")
+            invalidated.append(flagged_id)
+            print(f"[mailmind.fetch] thread updated — queuing background re-summarise for {flagged_id}")
+    return invalidated
+
+
+def _background_resurface(email_id: str) -> None:
+    """Daemon thread: re-generate a flagged conversation summary after a new reply arrives.
+
+    Exhausts the summarise_stream generator — the finally block inside saves the result
+    and updates ChromaDB, so no extra work needed here.
+    """
+    try:
+        for _ in summarise_stream(email_id):
+            pass
+    except Exception as e:
+        print(f"[mailmind] background re-summarise failed for {email_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,6 +172,8 @@ def list_emails(
     from datetime import datetime
 
     emails = list(store.load_emails().values())
+    # Sent reply records are stored for conversation context only, not inbox display
+    emails = [e for e in emails if e.get("direction") != "sent"]
     if flagged_only:
         emails = [e for e in emails if e.get("flagged")]
 
@@ -233,11 +256,19 @@ def summarise_stream(email_id: str):
         thread_emails = sorted(
             [
                 e for e in emails.values()
-                if e.get("sender_email") == sender_email
-                and e.get(
-                    "thread_subject",
-                    parsing.normalize_subject(e.get("subject", "")),
-                ) == thread_subject
+                if (
+                    # Incoming: same sender + same thread
+                    e.get("sender_email") == sender_email
+                    and e.get(
+                        "thread_subject",
+                        parsing.normalize_subject(e.get("subject", "")),
+                    ) == thread_subject
+                ) or (
+                    # Outgoing: replies we sent in this thread
+                    e.get("direction") == "sent"
+                    and e.get("related_sender_email") == sender_email
+                    and e.get("thread_subject") == thread_subject
+                )
             ],
             key=_time_key,
         )
@@ -291,6 +322,34 @@ def summarise_stream(email_id: str):
                         chroma.embed_email(saved[email_id], chroma_path)
 
 
+def get_thread(email_id: str) -> list[dict]:
+    """Return all emails in a thread: incoming from the sender + sent replies, chronological."""
+    emails = store.load_emails()
+    data = emails.get(email_id)
+    if not data:
+        raise LookupError("Email not found")
+
+    sender_email = data.get("sender_email", "")
+    thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
+
+    thread = sorted(
+        [
+            e for e in emails.values()
+            if (
+                e.get("sender_email") == sender_email
+                and e.get("thread_subject", parsing.normalize_subject(e.get("subject", ""))) == thread_subject
+                and e.get("direction") != "sent"
+            ) or (
+                e.get("direction") == "sent"
+                and e.get("related_sender_email") == sender_email
+                and e.get("thread_subject") == thread_subject
+            )
+        ],
+        key=_time_key,
+    )
+    return thread
+
+
 def toggle_flag(email_id: str) -> dict:
     emails = store.load_emails()
     if email_id not in emails:
@@ -313,18 +372,33 @@ def toggle_flag(email_id: str) -> dict:
     return {"flagged": new_flagged}
 
 
+def _delete_sent_entries(emails: dict, sender_email: str, thread_subject: str) -> None:
+    """Remove all logged sent replies for a given thread from the store dict (in-place)."""
+    orphan_ids = [
+        eid for eid, e in emails.items()
+        if e.get("direction") == "sent"
+        and e.get("related_sender_email") == sender_email
+        and e.get("thread_subject") == thread_subject
+    ]
+    for eid in orphan_ids:
+        del emails[eid]
+
+
 def dismiss(email_id: str, delete_embeddings: bool = False) -> dict:
     emails = store.load_emails()
     data = emails.get(email_id)
-    # Always clean up ChromaDB when a flagged email is dismissed — not doing so
-    # leaves orphan vectors that pollute reply-draft context forever.
     if data and data.get("flagged"):
+        # Clean up ChromaDB embedding
         chroma_path = module_settings.get("chroma_path", "")
         if chroma_path:
             chroma.delete_embedding(email_id, chroma_path)
+        # Clean up all sent reply records for this thread
+        sender_email = data.get("sender_email", "")
+        thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
+        _delete_sent_entries(emails, sender_email, thread_subject)
     if email_id in emails:
         del emails[email_id]
-        store.save_emails(emails)
+    store.save_emails(emails)
     return {"dismissed": True}
 
 
@@ -338,9 +412,16 @@ def block_sender(email_id: str) -> dict:
     if sender_email and sender_email.lower() not in bl:
         bl.append(sender_email.lower())
         store.save_blocklist(bl)
+    if data.get("flagged"):
+        # Clean up ChromaDB and sent reply records for this thread
+        chroma_path = module_settings.get("chroma_path", "")
+        if chroma_path:
+            chroma.delete_embedding(email_id, chroma_path)
+        thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
+        _delete_sent_entries(emails, sender_email, thread_subject)
     if email_id in emails:
         del emails[email_id]
-        store.save_emails(emails)
+    store.save_emails(emails)
     return {"blocked": sender_email, "blocklist": bl}
 
 
@@ -391,6 +472,34 @@ def send_reply(email_id: str, draft: str) -> dict:
         body=draft,
     )
     emails[email_id]["read"] = True
+
+    if data.get("flagged"):
+        # Flagged emails: record the sent reply so it's included in future conversation summaries,
+        # then invalidate so the next open re-generates with both sides of the thread.
+        s = module_settings.load()
+        user_name = s.get("user_name", "me")
+        now = datetime.now()
+        thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
+        sent_id = f"sent_{email_id}_{int(now.timestamp())}"
+        emails[sent_id] = {
+            "id": sent_id,
+            "sender": f"You ({user_name})",
+            "sender_email": "",
+            "subject": f"Re: {data.get('subject', '')}",
+            "thread_subject": thread_subject,
+            "body": draft,
+            "time": now.strftime("%H:%M"),
+            "time_raw": now.strftime("%a, %d %b %Y %H:%M:%S +0000"),
+            "direction": "sent",
+            "related_sender_email": data.get("sender_email", ""),
+            "read": True,
+            "flagged": False,
+            "summarised": True,
+            "summary": "",
+        }
+        emails[email_id]["summarised"] = False
+        emails[email_id]["summary"] = ""
+
     store.save_emails(emails)
     return {"sent": True}
 
