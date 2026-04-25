@@ -14,7 +14,7 @@ export default function Logo({ size = 20, showWordmark = true }) {
           letterSpacing: "-0.01em",
           color: "var(--text-0)",
         }}>
-          OpenClaw
+          OpenClaw-Py
         </span>
       )}
     </div>

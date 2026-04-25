@@ -1,5 +1,5 @@
 """
-OpenClaw — composition root.
+OpenClaw-Py — composition root.
 
 Run: uvicorn main:app --reload --port 8000
 
@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import APP_NAME, APP_VERSION, CORS_ORIGINS
+from core.setup_routes import router as setup_router
 from auth.routes import router as auth_router
 from providers.routes import router as providers_router
 from modules import mount_all, meta_router
@@ -26,6 +27,7 @@ app.add_middleware(
 )
 
 # Global routers
+app.include_router(setup_router)
 app.include_router(auth_router)
 app.include_router(providers_router)
 app.include_router(meta_router)

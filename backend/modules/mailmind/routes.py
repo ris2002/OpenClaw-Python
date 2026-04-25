@@ -59,9 +59,12 @@ def get_emails(
 
 
 @router.post("/emails/fetch")
-def fetch_emails():
+def fetch_emails(
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+):
     try:
-        return service.fetch_inbox()
+        return service.fetch_inbox(date_from=date_from, date_to=date_to)
     except RuntimeError as e:
         raise HTTPException(status_code=401, detail=str(e))
 

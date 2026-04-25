@@ -3,7 +3,9 @@ import Shell from "./core/Shell";
 import Logo from "./core/Logo";
 import Setup from "./pages/Setup";
 import Settings from "./pages/Settings";
+import LocationPicker from "./pages/LocationPicker";
 import { authApi } from "./api/auth";
+import { setupApi } from "./api/setup";
 import { providersApi } from "./api/providers";
 import { MODULES, getModule, moduleNavItems } from "./modules/registry";
 
@@ -18,10 +20,17 @@ export default function App() {
 
   useEffect(() => {
     const timeout = setTimeout(() => setPage("setup"), 3000);
-    authApi.status()
-      .then(data => {
-        clearTimeout(timeout);
-        setPage(data.authenticated ? "shell" : "setup");
+    setupApi.status()
+      .then(s => {
+        if (s.first_run) {
+          clearTimeout(timeout);
+          setPage("location");
+          return;
+        }
+        return authApi.status().then(data => {
+          clearTimeout(timeout);
+          setPage(data.authenticated ? "shell" : "setup");
+        });
       })
       .catch(() => {
         clearTimeout(timeout);
@@ -62,6 +71,10 @@ export default function App() {
         }}>STARTING…</div>
       </div>
     );
+  }
+
+  if (page === "location") {
+    return <LocationPicker onConfirmed={() => setPage("setup")} />;
   }
 
   if (page === "setup") {

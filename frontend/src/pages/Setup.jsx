@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Logo from "../core/Logo";
 import { authApi } from "../api/auth";
 import { providersApi } from "../api/providers";
@@ -24,10 +24,9 @@ export default function Setup({ onComplete }) {
   const [keyTesting, setKeyTesting] = useState({});
   const [keyMessages, setKeyMessages] = useState({});
 
-  const [gmail, setGmail] = useState("");
-  const [appPassword, setAppPassword] = useState("");
-  const [gmailStatus, setGmailStatus] = useState("idle");
+  const [gmailStatus, setGmailStatus] = useState("idle"); // idle | waiting | ok | error
   const [gmailError, setGmailError] = useState("");
+  const gmailPollRef = useRef(null);
 
   const [workStart, setWorkStart] = useState("09:00");
   const [workEnd, setWorkEnd] = useState("18:00");
@@ -73,16 +72,29 @@ export default function Setup({ onComplete }) {
   };
 
   const connectGmail = async () => {
-    setGmailStatus("testing");
     setGmailError("");
     try {
-      await authApi.connectGmail(gmail, appPassword);
-      setGmailStatus("ok");
+      const { url } = await authApi.loginUrl();
+      window.open(url, "_blank");
+      setGmailStatus("waiting");
+      // Poll until Google redirects back and the backend saves the token
+      gmailPollRef.current = setInterval(async () => {
+        try {
+          const { authenticated } = await authApi.status();
+          if (authenticated) {
+            clearInterval(gmailPollRef.current);
+            setGmailStatus("ok");
+          }
+        } catch {}
+      }, 2000);
     } catch (e) {
-      setGmailStatus("fail");
-      setGmailError(e.message);
+      setGmailStatus("error");
+      setGmailError(e.message || "Could not get sign-in URL — is client_secret.json in your workspace folder?");
     }
   };
+
+  // Clean up poll on unmount
+  useEffect(() => () => clearInterval(gmailPollRef.current), []);
 
   const finish = async () => {
     // Save any API keys the user entered
@@ -310,47 +322,41 @@ export default function Setup({ onComplete }) {
             <div>
               <h2 style={headingStyle}>Connect Gmail</h2>
               <p style={subheadingStyle}>
-                Uses a Gmail App Password. Your actual Google password is never entered.
+                Sign in with Google — no passwords to copy, no app passwords needed.
               </p>
+
               <div style={{
-                padding: 14, marginTop: 16, marginBottom: 20,
+                padding: 14, marginTop: 16, marginBottom: 24,
                 background: "var(--bg-2)", border: "1px solid var(--border-subtle)",
                 borderRadius: "var(--r-md)", fontSize: 12, color: "var(--text-2)", lineHeight: 1.7,
               }}>
-                <div style={{ color: "var(--text-1)", marginBottom: 6, fontWeight: 500 }}>
-                  To get an app password:
-                </div>
-                <div>1. Go to <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer"
-                  style={{ color: "var(--accent)", fontFamily: "var(--font-mono)", textDecoration: "none" }}>
-                  myaccount.google.com/apppasswords
-                </a></div>
-                <div>2. Name it "OpenClaw" → Generate</div>
-                <div>3. Copy the 16-character password</div>
-              </div>
-
-              <div style={{ marginBottom: 12 }}>
-                <div style={labelStyle}>Gmail address</div>
-                <input type="email" value={gmail} onChange={e => setGmail(e.target.value)}
-                  placeholder="you@gmail.com" className="oc-input" />
-              </div>
-              <div style={{ marginBottom: 16 }}>
-                <div style={labelStyle}>App password</div>
-                <input type="password" value={appPassword} onChange={e => setAppPassword(e.target.value)}
-                  placeholder="xxxx xxxx xxxx xxxx" className="oc-input"
-                  style={{ fontFamily: "var(--font-mono)" }} />
+                <div style={{ color: "var(--text-1)", marginBottom: 6, fontWeight: 500 }}>One-time setup required</div>
+                <div>1. Go to <span style={{ color: "var(--accent)", fontFamily: "var(--font-mono)" }}>console.cloud.google.com</span></div>
+                <div>2. Create a project → Enable <span style={{ fontFamily: "var(--font-mono)" }}>Gmail API</span></div>
+                <div>3. APIs & Services → Credentials → Create → OAuth 2.0 Client → Desktop App</div>
+                <div>4. Download the JSON → save as <span style={{ fontFamily: "var(--font-mono)" }}>~/Desktop/openclaw-py/client_secret.json</span></div>
+                <div style={{ marginTop: 8, color: "var(--text-3)" }}>Only needed once. Anyone cloning this repo does the same with their own Google account.</div>
               </div>
 
               {gmailStatus === "idle" && (
                 <button className="oc-btn oc-btn--primary" onClick={connectGmail}
-                  disabled={!gmail || !appPassword} style={{ width: "100%", padding: "11px" }}>
-                  Test connection
+                  style={{ width: "100%", padding: "11px" }}>
+                  Sign in with Google →
                 </button>
               )}
-              {gmailStatus === "testing" && <StatusPill color="var(--accent)" text="Testing connection…" />}
-              {gmailStatus === "ok" && <StatusPill color="var(--success)" text={`✓ Connected · ${gmail}`} />}
-              {gmailStatus === "fail" && (
+              {gmailStatus === "waiting" && (
+                <div>
+                  <StatusPill color="var(--accent)" text="Waiting for Google sign-in… (complete it in the browser tab)" />
+                  <button className="oc-btn" onClick={connectGmail}
+                    style={{ width: "100%", padding: "10px", marginTop: 10, fontSize: 12 }}>
+                    Open sign-in again
+                  </button>
+                </div>
+              )}
+              {gmailStatus === "ok" && <StatusPill color="var(--success)" text="✓ Gmail connected" />}
+              {gmailStatus === "error" && (
                 <>
-                  <StatusPill color="var(--danger)" text={`✗ ${gmailError || "Connection failed"}`} />
+                  <StatusPill color="var(--danger)" text={`✗ ${gmailError}`} />
                   <button className="oc-btn oc-btn--primary" onClick={connectGmail}
                     style={{ width: "100%", padding: "11px", marginTop: 10 }}>
                     Try again
@@ -418,7 +424,7 @@ export default function Setup({ onComplete }) {
               disabled={!canProceed()} style={{ flex: 2 }}>Continue →</button>
           ) : (
             <button className="oc-btn oc-btn--primary" onClick={finish}
-              disabled={!canProceed()} style={{ flex: 2 }}>Launch OpenClaw →</button>
+              disabled={!canProceed()} style={{ flex: 2 }}>Launch OpenClaw-Py →</button>
           )}
         </div>
       </main>

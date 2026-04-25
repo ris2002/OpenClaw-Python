@@ -1,7 +1,7 @@
 /**
  * MailMind module — registry entry.
  *
- * Every OpenClaw module exports:
+ * Every OpenClaw-Py module exports:
  *   manifest:     { id, name, description }
  *   Component:    main React component rendered when the module is active
  *   SettingsTab:  React component rendered inside Settings (optional)

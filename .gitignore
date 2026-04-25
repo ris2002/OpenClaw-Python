@@ -1,2 +1,37 @@
+# Python
 backend/venv/
 backend/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+*.env
+client_secret*.json
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/

@@ -4,3 +4,7 @@ pydantic>=2.5
 requests>=2.31
 cryptography>=42.0
 chromadb>=0.4
+filelock>=3.12
+google-auth>=2.0
+google-auth-oauthlib>=1.0
+google-api-python-client>=2.0

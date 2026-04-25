@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt_mod
 import email as email_lib
 import threading
@@ -29,29 +30,52 @@ def _time_key(e: dict) -> float:
 # ─────────────────────────────────────────────────────────────
 # Fetch
 # ─────────────────────────────────────────────────────────────
-def fetch_inbox() -> list[dict]:
-    """Fetch unread emails from Gmail IMAP and merge into the local store.
+def fetch_inbox(date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+    """Fetch emails from Gmail via the Gmail API and merge into the local store.
 
-    Uses IMAP UIDs (not sequence numbers) so IDs are stable across reconnections.
-    The same email always gets the same key, so summaries and flags survive backend restarts.
+    Gmail message IDs are permanent and stable across reconnections — the same
+    email always gets the same key, so summaries and flags survive backend restarts.
+
+    When date_from / date_to are provided (YYYY-MM-DD), they are forwarded to
+    Gmail as `after:` / `before:` query terms so only that window is retrieved.
     """
-    mail = gmail.get_imap()
-    mail.select("INBOX")
+    service = gmail.get_gmail_service()
 
-    # Fetch all emails (seen and unseen) — sort numerically so newest UIDs are last.
-    _, all_data = mail.uid("search", None, "ALL")
-    email_uids = sorted(all_data[0].split(), key=lambda uid: int(uid))[-30:]
+    q_parts: list[str] = []
+    if date_from:
+        try:
+            d = dt_mod.datetime.strptime(date_from, "%Y-%m-%d")
+            q_parts.append(f"after:{d.strftime('%Y/%m/%d')}")
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            d = dt_mod.datetime.strptime(date_to, "%Y-%m-%d")
+            # Gmail's before: is exclusive, so add one day to include the chosen end date
+            d_next = d + dt_mod.timedelta(days=1)
+            q_parts.append(f"before:{d_next.strftime('%Y/%m/%d')}")
+        except ValueError:
+            pass
+
+    list_kwargs: dict = {"userId": "me", "labelIds": ["INBOX"], "maxResults": 50}
+    if q_parts:
+        list_kwargs["q"] = " ".join(q_parts)
+
+    results = service.users().messages().list(**list_kwargs).execute()
+    message_refs = results.get("messages", [])
 
     emails = store.load_emails()
     existing_ids = set(emails.keys())
 
-    for uid in reversed(email_uids):
-        uid_str = uid.decode()
-        if uid_str in emails:
+    for ref in message_refs:
+        msg_id = ref["id"]
+        if msg_id in emails:
             continue
         try:
-            _, msg_data = mail.uid("fetch", uid_str, "(RFC822)")
-            raw = msg_data[0][1]
+            msg_data = service.users().messages().get(
+                userId="me", id=msg_id, format="raw"
+            ).execute()
+            raw = base64.urlsafe_b64decode(msg_data["raw"] + "==")
             msg = email_lib.message_from_bytes(raw)
 
             subject = parsing.decode_mime_header(msg.get("Subject", "(no subject)"))
@@ -72,8 +96,8 @@ def fetch_inbox() -> list[dict]:
             body = parsing.extract_body(msg)
             sender_name, sender_first = parsing.extract_real_name(sender_full)
 
-            emails[uid_str] = {
-                "id": uid_str,
+            emails[msg_id] = {
+                "id": msg_id,
                 "sender": sender_name,
                 "sender_first": sender_first,
                 "sender_email": sender_email_addr,
@@ -88,10 +112,8 @@ def fetch_inbox() -> list[dict]:
                 "summarised": False,
             }
         except Exception as e:
-            print(f"[mailmind.fetch] failed uid={uid_str}: {e}")
+            print(f"[mailmind.fetch] failed id={msg_id}: {e}")
             continue
-
-    mail.logout()
 
     # For every new email that belongs to a flagged thread, invalidate the summary
     # and immediately kick off a background re-summarise so the result is ready
@@ -109,6 +131,14 @@ def fetch_inbox() -> list[dict]:
             name=f"mailmind-resurface-{flagged_id}",
         )
         t.start()
+
+    # Persist the current Gmail historyId so the daemon can detect future
+    # arrivals cheaply via the History API instead of full inbox polling.
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        _save_history_id(str(profile["historyId"]))
+    except Exception:
+        pass
 
     all_emails = [e for e in emails.values() if e.get("direction") != "sent"]
     all_emails.sort(key=_time_key, reverse=True)
@@ -133,7 +163,7 @@ def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> list[str]:
             )
             flagged_index.setdefault(key, []).append(eid)
 
-    invalidated: list[str] = []
+    invalidated_set: set[str] = set()
     for eid in new_ids:
         e = emails.get(eid, {})
         key = (
@@ -141,11 +171,12 @@ def _invalidate_stale_thread_summaries(emails: dict, new_ids: set) -> list[str]:
             e.get("thread_subject", parsing.normalize_subject(e.get("subject", ""))),
         )
         for flagged_id in flagged_index.get(key, []):
-            emails[flagged_id]["summarised"] = False
-            emails[flagged_id]["summary"] = ""
-            invalidated.append(flagged_id)
-            print(f"[mailmind.fetch] thread updated — queuing background re-summarise for {flagged_id}")
-    return invalidated
+            if flagged_id not in invalidated_set:
+                emails[flagged_id]["summarised"] = False
+                emails[flagged_id]["summary"] = ""
+                invalidated_set.add(flagged_id)
+                print(f"[mailmind.fetch] thread updated — queuing background re-summarise for {flagged_id}")
+    return list(invalidated_set)
 
 
 def _background_resurface(email_id: str) -> None:
@@ -211,7 +242,7 @@ def summarise(email_id: str) -> dict:
     if data.get("summarised") and data.get("summary"):
         return {"summary": data["summary"]}
 
-    user_name = module_settings.get("user_name", "Rishil")
+    user_name = module_settings.get("user_name", "User")
     prompt = prompts.summary_prompt(
         sender=data.get("sender", ""),
         subject=data.get("subject", ""),
@@ -245,7 +276,7 @@ def summarise_stream(email_id: str):
         yield data["summary"]
         return
 
-    user_name = module_settings.get("user_name", "Rishil")
+    user_name = module_settings.get("user_name", "User")
 
     if data.get("flagged"):
         sender_email = data.get("sender_email", "")
@@ -388,18 +419,21 @@ def dismiss(email_id: str, delete_embeddings: bool = False) -> dict:
     emails = store.load_emails()
     data = emails.get(email_id)
     if data and data.get("flagged"):
-        # Clean up ChromaDB embedding
+        # Flagged dismiss: only wipe ChromaDB, then unflag.
+        # The email and conversation history stay in the store.
         chroma_path = module_settings.get("chroma_path", "")
         if chroma_path:
             chroma.delete_embedding(email_id, chroma_path)
-        # Clean up all sent reply records for this thread
-        sender_email = data.get("sender_email", "")
-        thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
-        _delete_sent_entries(emails, sender_email, thread_subject)
-    if email_id in emails:
-        del emails[email_id]
-    store.save_emails(emails)
-    return {"dismissed": True}
+        emails[email_id]["flagged"] = False
+        emails[email_id]["summarised"] = False
+        emails[email_id]["summary"] = ""
+        store.save_emails(emails)
+        return {"dismissed": True, "kept": True}
+    else:
+        if email_id in emails:
+            del emails[email_id]
+        store.save_emails(emails)
+        return {"dismissed": True, "kept": False}
 
 
 def block_sender(email_id: str) -> dict:
@@ -412,15 +446,29 @@ def block_sender(email_id: str) -> dict:
     if sender_email and sender_email.lower() not in bl:
         bl.append(sender_email.lower())
         store.save_blocklist(bl)
-    if data.get("flagged"):
-        # Clean up ChromaDB and sent reply records for this thread
-        chroma_path = module_settings.get("chroma_path", "")
+
+    chroma_path = module_settings.get("chroma_path", "")
+
+    # Remove every email from this sender (all threads, flagged or not)
+    sender_ids = [
+        eid for eid, e in emails.items()
+        if e.get("sender_email", "").lower() == sender_email.lower()
+        and e.get("direction") != "sent"
+    ]
+    for eid in sender_ids:
         if chroma_path:
-            chroma.delete_embedding(email_id, chroma_path)
-        thread_subject = data.get("thread_subject", parsing.normalize_subject(data.get("subject", "")))
-        _delete_sent_entries(emails, sender_email, thread_subject)
-    if email_id in emails:
-        del emails[email_id]
+            chroma.delete_embedding(eid, chroma_path)
+        del emails[eid]
+
+    # Also clean up any sent replies to this sender
+    sent_ids = [
+        eid for eid, e in emails.items()
+        if e.get("direction") == "sent"
+        and e.get("related_sender_email", "").lower() == sender_email.lower()
+    ]
+    for eid in sent_ids:
+        del emails[eid]
+
     store.save_emails(emails)
     return {"blocked": sender_email, "blocklist": bl}
 
@@ -435,8 +483,8 @@ def draft_reply(email_id: str, user_intent: str) -> dict:
         raise LookupError("Email not found")
 
     s = module_settings.load()
-    user_name = s.get("user_name", "Rishil")
-    user_title = s.get("user_title", "AI Engineer")
+    user_name = s.get("user_name", "User")
+    user_title = s.get("user_title", "Professional")
     system_prompt = s.get("system_prompt", "")
     context = data.get("summary") or data.get("body", "")[:400]
 
@@ -527,10 +575,76 @@ def remove_from_blocklist(entry: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# Daemon — background inbox poller
+# Gmail History API — lightweight new-mail detection
+# ─────────────────────────────────────────────────────────────
+_DAEMON_POLL_SECS = 60  # check for new mail every 60 seconds
+
+
+def _stored_history_id() -> str | None:
+    return module_settings.get("gmail_history_id")
+
+
+def _save_history_id(history_id: str) -> None:
+    s = module_settings.load()
+    s["gmail_history_id"] = str(history_id)
+    module_settings.save(s)
+
+
+def check_new_emails() -> bool:
+    """Detect new inbox messages via Gmail History API and fetch them if found.
+
+    This is O(1) — Gmail only returns changes since the stored historyId.
+    Returns True if new emails were fetched into the store.
+    """
+    stored_id = _stored_history_id()
+    if not stored_id:
+        # No baseline yet — full fetch establishes one (saves historyId at end).
+        fetch_inbox()
+        return True
+
+    svc = gmail.get_gmail_service()
+    try:
+        history = svc.users().history().list(
+            userId="me",
+            startHistoryId=stored_id,
+            historyTypes=["messageAdded"],
+            labelId="INBOX",
+        ).execute()
+    except Exception as e:
+        err = str(e)
+        if "404" in err or "startHistoryId" in err:
+            # historyId is older than ~30 days — reset via full fetch.
+            print(f"[mailmind] history ID stale, resetting: {e}")
+            fetch_inbox()
+            return True
+        print(f"[mailmind] history check error: {e}")
+        return False
+
+    # Always advance the stored ID to avoid replaying the same events.
+    new_history_id = history.get("historyId")
+    if new_history_id:
+        _save_history_id(new_history_id)
+
+    new_msg_ids = [
+        added["message"]["id"]
+        for record in history.get("history", [])
+        for added in record.get("messagesAdded", [])
+        if "INBOX" in added.get("message", {}).get("labelIds", [])
+    ]
+
+    if not new_msg_ids:
+        return False
+
+    print(f"[mailmind] {len(new_msg_ids)} new email(s) detected, fetching…")
+    fetch_inbox()
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
+# Daemon — real-time inbox watcher
 # ─────────────────────────────────────────────────────────────
 _daemon_state: dict[str, Any] = {
-    "running": False, "paused": False, "last_check": "—", "next_check": "—",
+    "running": False, "paused": False, "last_check": "—",
 }
 _stop_event: threading.Event = threading.Event()
 
@@ -546,43 +660,27 @@ def _within_work_hours(work_start: str, work_end: str) -> bool:
 
 
 def _daemon_loop(stop_event: threading.Event) -> None:
-    last_fetch: float = 0.0  # 0 → fetch immediately on first tick
-
     while not stop_event.is_set():
         if _daemon_state["paused"]:
-            # While paused reset timer so we fetch immediately on resume
-            last_fetch = 0.0
             stop_event.wait(timeout=2)
             continue
 
         s = module_settings.load()
-        interval_secs = int(s.get("check_interval", 30)) * 60
-        now = time.time()
+        work_start = s.get("work_start", "09:00")
+        work_end = s.get("work_end", "18:00")
 
-        if now - last_fetch >= interval_secs:
-            work_start = s.get("work_start", "09:00")
-            work_end = s.get("work_end", "18:00")
-
-            if _within_work_hours(work_start, work_end):
-                try:
-                    fetch_inbox()
+        if _within_work_hours(work_start, work_end):
+            try:
+                found = check_new_emails()
+                if found:
                     _daemon_state["last_check"] = datetime.now().strftime("%H:%M")
-                except Exception as e:
-                    print(f"[mailmind.daemon] fetch failed: {e}")
-            else:
-                print(f"[mailmind.daemon] outside work hours ({work_start}–{work_end}), skipping")
+            except Exception as e:
+                print(f"[mailmind.daemon] check failed: {e}")
 
-            last_fetch = time.time()
-            interval_mins = int(module_settings.get("check_interval", 30))
-            _daemon_state["next_check"] = (
-                datetime.now().strftime("%H:%M") + f" +{interval_mins}m"
-            )
-
-        stop_event.wait(timeout=5)  # responsive to stop within 5 s
+        stop_event.wait(timeout=_DAEMON_POLL_SECS)
 
     _daemon_state["running"] = False
     _daemon_state["paused"] = False
-    _daemon_state["next_check"] = "—"
 
 
 def daemon_status() -> dict:

@@ -38,13 +38,12 @@ export default function MailMind() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [fetchError, setFetchError] = useState("");
-  const [interval, setIntervalVal] = useState(30);
-  const [intervalSaving, setIntervalSaving] = useState(false);
   const [thread, setThread] = useState([]);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [flaggedOnly, setFlaggedOnly] = useState(false);
   const [filtering, setFiltering] = useState(false);
+  const [fetchingDates, setFetchingDates] = useState(false);
 
   const lastCheckRef = useRef("—");
   const filterRef   = useRef({ dateFrom: "", dateTo: "", flaggedOnly: false });
@@ -83,12 +82,11 @@ export default function MailMind() {
   };
 
   useEffect(() => {
-    Promise.all([mailmindApi.daemonStatus(), mailmindApi.list(), mailmindApi.getSettings()])
-      .then(([s, e, settings]) => {
+    Promise.all([mailmindApi.daemonStatus(), mailmindApi.list()])
+      .then(([s, e]) => {
         setStatus(s);
         lastCheckRef.current = s.last_check ?? "—";
         setEmails(Array.isArray(e) ? e : []);
-        if (settings?.check_interval) setIntervalVal(settings.check_interval);
       })
       .catch(() => {});
     const tick = setInterval(refreshStatus, 15000);
@@ -172,14 +170,6 @@ export default function MailMind() {
     await refreshStatus();
   };
 
-  const handleIntervalSave = async (val) => {
-    const mins = Math.max(1, parseInt(val) || 30);
-    setIntervalVal(mins);
-    setIntervalSaving(true);
-    await mailmindApi.saveSettings({ check_interval: mins }).catch(() => {});
-    setIntervalSaving(false);
-  };
-
   const handleFlag = async (email) => {
     try {
       const res = await mailmindApi.flag(email.id);
@@ -199,10 +189,23 @@ export default function MailMind() {
     } catch (e) { console.error(e); }
   };
 
-  const handleDismiss = (emailId) => {
-    mailmindApi.dismiss(emailId).catch(() => {});
-    setEmails(prev => prev.filter(e => e.id !== emailId));
-    if (selectedEmail?.id === emailId) setSelectedEmail(null);
+  const handleDismiss = async (emailId) => {
+    try {
+      const res = await mailmindApi.dismiss(emailId);
+      if (res?.kept) {
+        // Was flagged — email stays, just unflagged and summary reset
+        setEmails(prev => prev.map(e =>
+          e.id === emailId ? { ...e, flagged: false, summarised: false, summary: "" } : e
+        ));
+        if (selectedEmail?.id === emailId) {
+          setSelectedEmail(prev => ({ ...prev, flagged: false, summarised: false, summary: "" }));
+          setThread([]);
+        }
+      } else {
+        setEmails(prev => prev.filter(e => e.id !== emailId));
+        if (selectedEmail?.id === emailId) setSelectedEmail(null);
+      }
+    } catch {}
   };
 
   const handleBlockSender = async (emailId) => {
@@ -256,9 +259,18 @@ export default function MailMind() {
     setFiltering(true);
     filterRef.current = { dateFrom, dateTo, flaggedOnly };
     try {
+      if (dateFrom || dateTo) {
+        setFetchingDates(true);
+        const fetched = await mailmindApi.fetchInboxForDates(dateFrom, dateTo);
+        setFetchingDates(false);
+        if (Array.isArray(fetched)) setEmails(prev => mergeEmails(fetched, prev));
+      }
       const filtered = await mailmindApi.listFiltered(dateFrom, dateTo, flaggedOnly);
       setEmails(Array.isArray(filtered) ? filtered : []);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      setFetchingDates(false);
+      console.error(e);
+    }
     setFiltering(false);
   };
 
@@ -319,7 +331,7 @@ export default function MailMind() {
             animation: status.running && !status.paused ? "oc-pulse 2s infinite" : "none",
           }} />
           {status.running
-            ? status.paused ? "auto · paused" : `auto · next ${status.next_check}`
+            ? status.paused ? "auto · paused" : "auto · live"
             : "manual only"}
         </div>
 
@@ -328,24 +340,6 @@ export default function MailMind() {
           {unread > 0 && <span style={{ color: "var(--accent)" }}> · {unread} unread</span>}
           {status.last_check && status.last_check !== "—" && <> · last {status.last_check}</>}
         </span>
-
-        {/* Interval editor */}
-        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-          <span style={{ fontSize: 11, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>every</span>
-          <input
-            type="number" min={1} value={interval}
-            onChange={e => setIntervalVal(e.target.value)}
-            onBlur={e => handleIntervalSave(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && handleIntervalSave(e.target.value)}
-            className="oc-input"
-            style={{
-              width: 48, padding: "5px 8px", fontSize: 12,
-              fontFamily: "var(--font-mono)", textAlign: "center",
-              opacity: intervalSaving ? 0.5 : 1,
-            }}
-          />
-          <span style={{ fontSize: 11, color: "var(--text-3)", fontFamily: "var(--font-mono)" }}>min</span>
-        </div>
 
         {/* Daemon controls */}
         {status.running ? (
@@ -407,15 +401,35 @@ export default function MailMind() {
                 Flagged only
               </label>
               <div style={{ flex: 1 }} />
-              {(dateFrom || dateTo || flaggedOnly) && (
+              {(dateFrom || dateTo || flaggedOnly) && !filtering && (
                 <button onClick={handleClearFilter} style={{ fontSize: 10, color: "var(--text-3)", background: "transparent", border: "none", cursor: "pointer", textDecoration: "underline" }}>Clear</button>
               )}
-              <button onClick={handleFilter}
+              <button onClick={handleFilter} disabled={filtering}
                 className={dateFrom || dateTo || flaggedOnly ? "oc-btn oc-btn--primary" : "oc-btn"}
                 style={{ padding: "4px 10px", fontSize: 10 }}>
                 {filtering ? "…" : "Filter"}
               </button>
             </div>
+
+            {fetchingDates && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 7,
+                padding: "7px 10px",
+                background: "var(--accent-soft)", border: "1px solid var(--accent-line)",
+                borderRadius: "var(--r-sm)",
+              }}>
+                <div style={{
+                  width: 10, height: 10, borderRadius: "50%",
+                  border: "1.5px solid var(--accent)",
+                  borderTopColor: "transparent",
+                  animation: "oc-spin 0.7s linear infinite",
+                  flexShrink: 0,
+                }} />
+                <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--accent)", letterSpacing: "0.06em" }}>
+                  Fetching from Gmail…
+                </span>
+              </div>
+            )}
           </div>
 
           <div>

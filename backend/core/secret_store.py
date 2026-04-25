@@ -3,6 +3,9 @@ Local secret store for provider API keys and other sensitive values.
 
 Stores JSON encrypted with Fernet. Master key lives alongside, chmod 600.
 If `cryptography` isn't installed, falls back to plaintext with a warning.
+
+All file paths are resolved at call time (not import time) so they reflect
+the user's chosen data directory even if set_data_dir() was called after import.
 """
 
 from __future__ import annotations
@@ -12,11 +15,17 @@ import os
 import stat
 from typing import Optional
 
-from .config import DATA_DIR
+from . import config
 
-KEYS_ENC = DATA_DIR / "keys.enc"
-KEYS_PLAIN = DATA_DIR / "keys.json"  # fallback only
-MASTER_KEY = DATA_DIR / "master.key"
+
+def _keys_enc():
+    return config.DATA_DIR / "keys.enc"
+
+def _keys_plain():
+    return config.DATA_DIR / "keys.json"
+
+def _master_key():
+    return config.DATA_DIR / "master.key"
 
 
 def _have_crypto() -> bool:
@@ -29,26 +38,27 @@ def _have_crypto() -> bool:
 
 def _get_fernet():
     from cryptography.fernet import Fernet
-    if not MASTER_KEY.exists():
-        MASTER_KEY.write_bytes(Fernet.generate_key())
+    mk = _master_key()
+    if not mk.exists():
+        mk.write_bytes(Fernet.generate_key())
         try:
-            os.chmod(MASTER_KEY, stat.S_IRUSR | stat.S_IWUSR)
+            os.chmod(mk, stat.S_IRUSR | stat.S_IWUSR)
         except Exception:
             pass
-    return Fernet(MASTER_KEY.read_bytes())
+    return Fernet(mk.read_bytes())
 
 
 def load_keys() -> dict:
-    if _have_crypto() and KEYS_ENC.exists():
+    if _have_crypto() and _keys_enc().exists():
         try:
             f = _get_fernet()
-            return json.loads(f.decrypt(KEYS_ENC.read_bytes()).decode("utf-8"))
+            return json.loads(f.decrypt(_keys_enc().read_bytes()).decode("utf-8"))
         except Exception as e:
             print(f"[secret_store] decrypt failed: {e}")
             return {}
-    if KEYS_PLAIN.exists():
+    if _keys_plain().exists():
         try:
-            return json.loads(KEYS_PLAIN.read_text())
+            return json.loads(_keys_plain().read_text())
         except Exception:
             return {}
     return {}
@@ -57,21 +67,21 @@ def load_keys() -> dict:
 def _write_keys(keys: dict) -> None:
     if _have_crypto():
         f = _get_fernet()
-        KEYS_ENC.write_bytes(f.encrypt(json.dumps(keys).encode("utf-8")))
+        _keys_enc().write_bytes(f.encrypt(json.dumps(keys).encode("utf-8")))
         try:
-            os.chmod(KEYS_ENC, stat.S_IRUSR | stat.S_IWUSR)
+            os.chmod(_keys_enc(), stat.S_IRUSR | stat.S_IWUSR)
         except Exception:
             pass
-        if KEYS_PLAIN.exists():
+        if _keys_plain().exists():
             try:
-                KEYS_PLAIN.unlink()
+                _keys_plain().unlink()
             except Exception:
                 pass
     else:
         print("[secret_store] WARNING: cryptography not installed — storing keys in plaintext")
-        KEYS_PLAIN.write_text(json.dumps(keys, indent=2))
+        _keys_plain().write_text(json.dumps(keys, indent=2))
         try:
-            os.chmod(KEYS_PLAIN, stat.S_IRUSR | stat.S_IWUSR)
+            os.chmod(_keys_plain(), stat.S_IRUSR | stat.S_IWUSR)
         except Exception:
             pass
 

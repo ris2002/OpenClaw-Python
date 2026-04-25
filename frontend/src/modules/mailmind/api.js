@@ -14,6 +14,12 @@ export const mailmindApi = {
     return get(`${BASE}/emails?${params}`);
   },
   fetchInbox:     () => post(`${BASE}/emails/fetch`),
+  fetchInboxForDates: (from, to) => {
+    const params = new URLSearchParams();
+    if (from) params.append("date_from", from);
+    if (to) params.append("date_to", to);
+    return post(`${BASE}/emails/fetch?${params}`);
+  },
   summarise:      (id) => post(`${BASE}/emails/${id}/summarise`),
   summariseStream: async (id, onChunk) => {
     const res = await fetch(`${BACKEND}${BASE}/emails/${id}/summarise/stream`, { method: "POST" });

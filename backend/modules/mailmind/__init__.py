@@ -1,7 +1,7 @@
 """
 MailMind — inbox triage module.
 
-Every OpenClaw module exports a `manifest` dict with:
+Every OpenClaw-Py module exports a `manifest` dict with:
   id          — url-safe slug (matches frontend module id)
   name        — display name
   description — one-liner
